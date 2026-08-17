@@ -1,0 +1,143 @@
+name: Android CI
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build APKs
+        id: build
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+
+          start_time="$(date +%s)"
+          ./gradlew assembleDebug assembleRelease --no-daemon
+          end_time="$(date +%s)"
+          duration_seconds=$((end_time - start_time))
+
+          echo "duration_seconds=${duration_seconds}" >> "$GITHUB_OUTPUT"
+
+      - name: Collect release metadata
+        id: meta
+        env:
+          BUILD_DURATION: ${{ steps.build.outputs.duration_seconds }}
+        run: |
+          set -euo pipefail
+
+          VERSION_CODE="$(git rev-list --count HEAD)"
+          VERSION_NAME="1.${VERSION_CODE}"
+          RELEASE_TAG="v${VERSION_CODE}"
+          COMMIT_SHA="$(git rev-parse --short HEAD)"
+          COMMIT_URL="https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+          RELEASE_APK="$(find app/build/outputs/apk/release -type f -name '*.apk' -print -quit)"
+          DEBUG_APK="$(find app/build/outputs/apk/debug -type f -name '*.apk' -print -quit)"
+
+          test -f "$RELEASE_APK"
+          test -f "$DEBUG_APK"
+
+          mkdir -p dist
+          RELEASE_APK_NAME="Termux-Double-Click-Drawer-v${VERSION_CODE}-release.apk"
+          DEBUG_APK_NAME="Termux-Double-Click-Drawer-v${VERSION_CODE}-debug.apk"
+          cp "$RELEASE_APK" "dist/${RELEASE_APK_NAME}"
+          cp "$DEBUG_APK" "dist/${DEBUG_APK_NAME}"
+          sha256sum "dist/${RELEASE_APK_NAME}" "dist/${DEBUG_APK_NAME}" > dist/SHA256SUMS
+
+          {
+            echo "## Build"
+            echo
+            echo "- Version: \`${VERSION_NAME}\`"
+            echo "- VersionCode: \`${VERSION_CODE}\`"
+            echo "- Commit: [\`${COMMIT_SHA}\`](${COMMIT_URL})"
+            echo "- Build time: ${BUILD_DURATION}s"
+            echo
+            echo '```text'
+            git log -1 --pretty=%B
+            echo '```'
+          } > dist/release-notes.md
+
+          {
+            echo "version_code=${VERSION_CODE}"
+            echo "version_name=${VERSION_NAME}"
+            echo "release_tag=${RELEASE_TAG}"
+            echo "commit_sha=${COMMIT_SHA}"
+            echo "commit_url=${COMMIT_URL}"
+            echo "release_apk_name=${RELEASE_APK_NAME}"
+            echo "debug_apk_name=${DEBUG_APK_NAME}"
+          } >> "$GITHUB_OUTPUT"
+
+          cat dist/release-notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create Git tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          existing_sha="$(git ls-remote "$remote" "refs/tags/${RELEASE_TAG}^{}" | cut -f1)"
+          if [ -z "$existing_sha" ]; then
+            existing_sha="$(git ls-remote "$remote" "refs/tags/${RELEASE_TAG}" | cut -f1)"
+          fi
+
+          if [ -n "$existing_sha" ]; then
+            test "$existing_sha" = "$GITHUB_SHA" || {
+              echo "Tag ${RELEASE_TAG} already points to ${existing_sha}, expected ${GITHUB_SHA}." >&2
+              exit 1
+            }
+            echo "Tag ${RELEASE_TAG} already exists for this commit."
+          else
+            git tag -a "$RELEASE_TAG" "$GITHUB_SHA" -m "Release ${RELEASE_TAG}"
+            git push "$remote" "refs/tags/${RELEASE_TAG}"
+          fi
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.release_tag }}
+          name: Termux Double Click Drawer ${{ steps.meta.outputs.version_name }}
+          body_path: dist/release-notes.md
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          overwrite_files: true
+          files: |
+            dist/${{ steps.meta.outputs.release_apk_name }}
+            dist/${{ steps.meta.outputs.debug_apk_name }}
+            dist/SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
